@@ -1,46 +1,68 @@
-/**
- * Welcome to Cloudflare Workers! This is your first worker.
- *
- * - Run `npm run dev` in your terminal to start a development server
- * - Open a browser tab at http://localhost:8787/ to see your worker in action
- * - Run `npm run deploy` to publish your worker
- *
- * Learn more at https://developers.cloudflare.com/workers/
- */
+const WELCOME_TEXT =
+	'{"name":"PeerJS Server","description":"A server side element to broker connections between PeerJS clients.","website":"https://peerjs.com/"}';
+const HEARTBEAT = '{"type":"HEARTBEAT"}';
+const OPEN = '{"type":"OPEN"}';
+const ID_TAKEN = '{"type":"ID-TAKEN","payload":{"msg":"ID is taken"}}';
 
-import handleProxy from './proxy';
-import handleRedirect from './redirect';
-import apiRouter from './router';
+export class PeerServerDO implements DurableObject {
+	constructor(
+		private state: DurableObjectState,
+		private env: Env,
+	) {
+		this.state.setWebSocketAutoResponse(new WebSocketRequestResponsePair(HEARTBEAT, HEARTBEAT));
+	}
+	async fetch(request: Request) {
+		const url = new URL(request.url);
+		const id = url.searchParams.get('id');
+		const token = url.searchParams.get('token');
+		if (!id || !token) return new Response(null, { status: 400 });
+		const [wsclient, wsserver] = Object.values(new WebSocketPair());
 
-// Export a default object containing event handlers
+		const existingWss = this.state.getWebSockets(id);
+		if (existingWss.length > 0 && existingWss[0].deserializeAttachment().token !== token) {
+			wsserver.accept();
+			wsserver.send(ID_TAKEN);
+			wsserver.close(1008, 'ID is taken');
+			return new Response(null, { webSocket: wsclient, status: 101 });
+		} else {
+			existingWss.forEach((ws) => ws.close(1000));
+		}
+
+		this.state.acceptWebSocket(wsserver, [id]);
+		wsserver.serializeAttachment({ id, token });
+		wsserver.send(OPEN);
+
+		return new Response(null, { webSocket: wsclient, status: 101 });
+	}
+	webSocketMessage(ws: WebSocket, message: string): void | Promise<void> {
+		const msg = JSON.parse(message);
+		const dstWs = this.state.getWebSockets(msg.dst)[0];
+		msg.src = ws.deserializeAttachment().id;
+		dstWs.send(JSON.stringify(msg));
+	}
+}
+
 export default {
-	// The fetch handler is invoked when this worker receives a HTTP(S) request
-	// and should return a Response (optionally wrapped in a Promise)
-	async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
-		// You'll find it helpful to parse the request.url string into a URL object. Learn more at https://developer.mozilla.org/en-US/docs/Web/API/URL
+	async fetch(request: Request, env: Env) {
 		const url = new URL(request.url);
 
-		// You can get pretty far with simple logic like if/switch-statements
 		switch (url.pathname) {
-			case '/redirect':
-				return handleRedirect.fetch(request, env, ctx);
-
-			case '/proxy':
-				return handleProxy.fetch(request, env, ctx);
+			case '/':
+				return new Response(WELCOME_TEXT);
+			case '/peerjs':
+				let objId = env.PEER_SERVER.idFromName(url.host);
+				let stub = env.PEER_SERVER.get(objId);
+				return stub.fetch(request);
+			case '/peerjs/id':
+				return new Response(crypto.randomUUID(), {
+					status: 200,
+					headers: {
+						'Content-Type': 'text/plain',
+						'Access-Control-Allow-Origin': '*',
+					},
+				});
+			default:
+				return new Response(null, { status: 404 });
 		}
-
-		if (url.pathname.startsWith('/api/')) {
-			// You can also use more robust routing
-			return apiRouter.handle(request);
-		}
-
-		return new Response(
-			`Try making requests to:
-      <ul>
-      <li><code><a href="/redirect?redirectUrl=https://example.com/">/redirect?redirectUrl=https://example.com/</a></code>,</li>
-      <li><code><a href="/proxy?modify&proxyUrl=https://example.com/">/proxy?modify&proxyUrl=https://example.com/</a></code>, or</li>
-      <li><code><a href="/api/todos">/api/todos</a></code></li>`,
-			{ headers: { 'Content-Type': 'text/html' } }
-		);
 	},
 };
